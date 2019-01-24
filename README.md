@@ -12,3 +12,6 @@ GoFi File Sync Client
 ## about
 Just an UDP client that crawls through the dir you're standing in recursively and sends the file-info (name, path, size, if its a directory) and machine-data (ip, hostname) to the gofi_server.
 It's a form of file-indexer for remote machines.
+
+## links
+GoFi server: https://github.com/dvwallin/gofi_server
