@@ -1,18 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"path"
+	"path/filepath"
+	"strconv"
+	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/gosuri/uiprogress"
 	"github.com/iafan/cwalk"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/sony/sonyflake"
 )
 
 type (
@@ -25,71 +30,103 @@ type (
 		Machine string `json:"machine"`
 		IP      string `json:"ip"`
 	}
-	Files []File
+	Files      []File
+	myFileInfo struct {
+		name string
+		data []byte
+	}
+	MyFile struct {
+		*bytes.Reader
+		mif myFileInfo
+	}
+)
+
+const (
+	BUFFERSIZE   = 2048
+	SERVER_PORT  = 1985
+	GOFI_TMP_DIR = ".gofi_tmp/"
 )
 
 var (
-	myIP       string
-	myHostname string
-	myDir      string
-	err        error
-	files      Files
+	myIP            string
+	myHostname      string
+	myDir           string
+	err             error
+	files           Files
+	fileCountOutput int = 0
 
-	targetURL *string = flag.String("target_url", "127.0.0.1:1985", "the URL where gofi_server is running")
+	targetURL *string = flag.String("target_url", fmt.Sprintf("127.0.0.1:%d", SERVER_PORT), "the URL where gofi_server is running")
 	dryRun    *bool   = flag.Bool("dry_run", false, "set this to true if the results should be printed and NOT sent to the server")
 )
 
-func main() {
+func (mif myFileInfo) Name() string       { return mif.name }
+func (mif myFileInfo) Size() int64        { return int64(len(mif.data)) }
+func (mif myFileInfo) Mode() os.FileMode  { return 0444 }        // Read for all
+func (mif myFileInfo) ModTime() time.Time { return time.Time{} } // Return anything
+func (mif myFileInfo) IsDir() bool        { return false }
+func (mif myFileInfo) Sys() interface{}   { return nil }
+
+func (mf *MyFile) Close() error { return nil } // Noop, nothing to do
+
+func (mf *MyFile) Readdir(count int) ([]os.FileInfo, error) {
+	return nil, nil // We are not a directory but a single file
+}
+
+func (mf *MyFile) Stat() (os.FileInfo, error) {
+	return mf.mif, nil
+}
+
+func init() {
 	flag.Parse()
 
-	myIP = getIP()
+	myIP, err = getIP()
+	if err != nil {
+		log.Println("error getting client IP", err)
+	}
 	myHostname, err = os.Hostname()
 	if err != nil {
-		log.Println(err)
+		log.Println("error getting client hostname", err)
 	}
 
 	myDir, err = os.Getwd()
 	if err != nil {
 		log.Println(err)
 	}
-
-	getFiles()
+	// Create the GOFI_TMP_DIR in case it does not exist already
+	newpath := filepath.Join(".", GOFI_TMP_DIR)
+	os.MkdirAll(newpath, os.ModePerm)
 }
 
-func CheckError(err error) {
+func main() {
+	connection, err := net.Dial("tcp", *targetURL)
 	if err != nil {
-		fmt.Println("Error: ", err)
+		panic(err)
 	}
+	defer connection.Close()
+
+	files, err := getFiles()
+	if err != nil {
+		log.Println("error getting files", err)
+	}
+
+	b, err := json.Marshal(files)
+	if err != nil {
+		log.Println("error marshaling files content", err)
+	}
+
+	id, err := genSonyflakeID()
+	if err != nil {
+		log.Println("error getting sonyflake id", err)
+	}
+
+	sendFileToServer(b, id, connection) // Sending file to server
 }
 
-func conn(file File) bool {
-	ServerAddr, err := net.ResolveUDPAddr("udp", *targetURL)
-	CheckError(err)
-
-	LocalAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:0", myIP))
-	CheckError(err)
-
-	Conn, err := net.DialUDP("udp", LocalAddr, ServerAddr)
-	CheckError(err)
-	defer Conn.Close()
-
-	b, err := json.Marshal(file)
-	if err != nil {
-		log.Println(err)
-		return false
-	}
-	_, err = Conn.Write(b)
-	if err != nil {
-		fmt.Println(file, err)
-	}
-	return true
-}
-
-func getIP() (ip string) {
+func getIP() (ip string, err error) {
 	ip = "unknown"
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		log.Println(err)
+		return ip, err
 	}
 
 	for _, a := range addrs {
@@ -99,16 +136,20 @@ func getIP() (ip string) {
 			}
 		}
 	}
-	return
+	return ip, nil
 }
 
-func getFiles() (foundFiles Files) {
-	var files Files
+func getFiles() (files Files, err error) {
 	fmt.Println("collecting file information ...")
-	err := cwalk.Walk(".",
+	err = cwalk.Walk(".",
 		func(filePath string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
+			}
+			fileCountOutput++
+			if fileCountOutput/5000 == 1 {
+				fmt.Printf("#")
+				fileCountOutput = 0
 			}
 			filePath = path.Join(myDir, filePath)
 			file := File{
@@ -132,23 +173,76 @@ func getFiles() (foundFiles Files) {
 			return nil
 		})
 	if err != nil {
-		log.Println(err)
+		return Files{}, err
 	}
 
 	count := len(files)
 
-	fmt.Println("found", count, "files ...")
+	fmt.Println("\nfound", count, "files ...")
 
-	uiprogress.Start()
-	bar := uiprogress.AddBar(count).AppendCompleted().PrependElapsed()
-	bar.PrependFunc(func(b *uiprogress.Bar) string {
-		return fmt.Sprintf("Sending file %d / %d", b.Current(), count)
-	})
+	return files, nil
+}
 
-	for _, v := range files {
-		conn(v)
-		bar.Incr()
+func sendFileToServer(data []byte, id uint64, connection net.Conn) (err error) {
+	defer connection.Close()
+
+	mf := &MyFile{
+		Reader: bytes.NewReader(data),
+		mif: myFileInfo{
+			name: fmt.Sprintf("gofi_%d", id),
+			data: data,
+		},
 	}
-	uiprogress.Stop()
-	return
+
+	fileInfo, err := mf.Stat()
+	if err != nil {
+		return err
+	}
+
+	fileSize := fillString(strconv.FormatInt(fileInfo.Size(), 10), 10)
+	fillestringFilename := fillString(fileInfo.Name(), 64)
+
+	fmt.Println("sending name and size of temporary file ...")
+	connection.Write([]byte(fileSize))
+
+	connection.Write([]byte(fillestringFilename))
+
+	sendBuffer := make([]byte, BUFFERSIZE)
+	fmt.Println("sending temporary ...")
+	for {
+		_, err = mf.Read(sendBuffer)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+		connection.Write(sendBuffer)
+	}
+	fmt.Println("temporary file has been sent ...")
+	if err := mf.Close(); err != nil {
+		return err
+	}
+	fmt.Println("temporary file has been removed ...")
+	return nil
+}
+
+func fillString(retunString string, toLength int) string {
+	for {
+		lengtString := len(retunString)
+		if lengtString < toLength {
+			retunString = retunString + ":"
+			continue
+		}
+		break
+	}
+	return retunString
+}
+
+func genSonyflakeID() (id uint64, err error) {
+	flake := sonyflake.NewSonyflake(sonyflake.Settings{})
+	id, err = flake.NextID()
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
 }
