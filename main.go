@@ -2,33 +2,38 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
+	"database/sql"
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"path"
-	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/iafan/cwalk"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/sony/sonyflake"
+	PUUID "github.com/pborman/uuid"
+	pb "gopkg.in/cheggaaa/pb.v1"
 )
 
 type (
 	File struct {
-		ID      string `json:"id,omitempty"`
-		Name    string `json:"name,omitempty"`
-		Path    string `json:"path,omitempty"`
-		Size    int64  `json:"size"`
-		IsDir   int    `json:"isdir"`
-		Machine string `json:"machine"`
-		IP      string `json:"ip"`
+		ID               string `json:"id,omitempty"`
+		Name             string `json:"name,omitempty"`
+		Path             string `json:"path,omitempty"`
+		Size             int64  `json:"size"`
+		IsDir            int    `json:"isdir"`
+		Machine          string `json:"machine"`
+		IP               string `json:"ip"`
+		OnExternalSource int    `json:"on_external_source"`
+		ExternalName     string `json:"external_name"`
+		FileType         string `json:"file_type"`
+		FileMIME         string `json:"file_mime"`
 	}
 	Files      []File
 	myFileInfo struct {
@@ -42,21 +47,28 @@ type (
 )
 
 const (
-	BUFFERSIZE   = 2048
-	SERVER_PORT  = 1985
-	GOFI_TMP_DIR = ".gofi_tmp/"
+	BUFFERSIZE         = 2048
+	SERVER_PORT        = 1985
+	GOFI_DATABASE_NAME = "gofi.db"
 )
 
 var (
-	myIP            string
-	myHostname      string
-	myDir           string
-	err             error
-	files           Files
-	fileCountOutput int = 0
+	myIP       string
+	myHostname string
+	myDir      string
+	err        error
+	files      Files
+	b          []byte
 
-	targetURL *string = flag.String("target_url", fmt.Sprintf("127.0.0.1:%d", SERVER_PORT), "the URL where gofi_server is running")
-	dryRun    *bool   = flag.Bool("dry_run", false, "set this to true if the results should be printed and NOT sent to the server")
+	targetURL    *string = flag.String("target_url", fmt.Sprintf("127.0.0.1:%d", SERVER_PORT), "the URL where gofi_server is running")
+	dryRun       *bool   = flag.Bool("dry_run", false, "set this to true if the results should be printed and NOT sent to the server")
+	externalName *string = flag.String("external_name", "n/a", "set this to a name of the external source to label it as external")
+
+	db          *sql.DB
+	stmt        *sql.Stmt
+	res         sql.Result
+	fileCount   int    = 0
+	storageFile string = fmt.Sprintf("./%s_%s", getUUID(), GOFI_DATABASE_NAME)
 )
 
 func (mif myFileInfo) Name() string       { return mif.name }
@@ -92,9 +104,37 @@ func init() {
 	if err != nil {
 		log.Println(err)
 	}
-	// Create the GOFI_TMP_DIR in case it does not exist already
-	newpath := filepath.Join(".", GOFI_TMP_DIR)
-	os.MkdirAll(newpath, os.ModePerm)
+
+	log.Println("connecting to", storageFile)
+
+	// Connect to the database
+	db, err = sql.Open("sqlite3", storageFile)
+	if err != nil {
+		log.Println(err)
+	}
+
+	// Make sure the correct scheme exists
+	sqlStmt := `
+		CREATE TABLE IF NOT EXISTS files 
+			(	id integer NOT NULL primary key, 
+				name text NOT NULL, 
+				path text NOT NULL, 
+				size integer NOT NULL, 
+				isdir integer NOT NULL, 
+				machine text NOT NULL, 
+				ip text NOT NULL,
+				onexternalsource integer NOT NULL,
+				externalname text NOT NULL,
+				filetype text NOT NULL,
+				filemime text NOT NULL,
+			CONSTRAINT path_unique UNIQUE (path, machine, ip, onexternalsource, externalname)
+			);
+	`
+	_, err = db.Exec(sqlStmt)
+	if err != nil {
+		log.Printf("%q: %s\n", err, sqlStmt)
+		return
+	}
 }
 
 func main() {
@@ -109,17 +149,24 @@ func main() {
 		log.Println("error getting files", err)
 	}
 
-	b, err := json.Marshal(files)
+	err = addFiles(files)
 	if err != nil {
-		log.Println("error marshaling files content", err)
+		log.Println("error adding files to local db", err)
 	}
 
-	id, err := genSonyflakeID()
+	file, err := os.Open(storageFile)
 	if err != nil {
-		log.Println("error getting sonyflake id", err)
+		log.Println("error opening", storageFile, err)
 	}
 
-	sendFileToServer(b, id, connection) // Sending file to server
+	b, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Println("error reading", storageFile, err)
+	}
+
+	sendFileToServer(b, getUUID(), connection) // Sending file to server
+
+	deleteStorageFile() // Delete created storage file
 }
 
 func getIP() (ip string, err error) {
@@ -140,25 +187,28 @@ func getIP() (ip string, err error) {
 }
 
 func getFiles() (files Files, err error) {
-	fmt.Println("collecting file information ...")
+	var (
+		tmp_on_external int = 0
+	)
+	if *externalName != "n/a" {
+		tmp_on_external = 1
+	}
+	log.Println("collecting file information ...")
 	err = cwalk.Walk(".",
 		func(filePath string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
-			fileCountOutput++
-			if fileCountOutput/5000 == 1 {
-				fmt.Printf("#")
-				fileCountOutput = 0
-			}
 			filePath = path.Join(myDir, filePath)
 			file := File{
-				Name:    info.Name(),
-				Path:    filePath,
-				Size:    info.Size(),
-				Machine: myHostname,
-				IsDir:   0,
-				IP:      myIP,
+				Name:             info.Name(),
+				Path:             filePath,
+				Size:             info.Size(),
+				Machine:          myHostname,
+				IsDir:            0,
+				IP:               myIP,
+				OnExternalSource: tmp_on_external,
+				ExternalName:     *externalName,
 			}
 			if info.IsDir() {
 				file.IsDir = 1
@@ -178,18 +228,18 @@ func getFiles() (files Files, err error) {
 
 	count := len(files)
 
-	fmt.Println("\nfound", count, "files ...")
+	log.Println("\nfound", count, "files ...")
 
 	return files, nil
 }
 
-func sendFileToServer(data []byte, id uint64, connection net.Conn) (err error) {
+func sendFileToServer(data []byte, id string, connection net.Conn) (err error) {
 	defer connection.Close()
 
 	mf := &MyFile{
 		Reader: bytes.NewReader(data),
 		mif: myFileInfo{
-			name: fmt.Sprintf("gofi_%d", id),
+			name: fmt.Sprintf("gofi_%s.db", id),
 			data: data,
 		},
 	}
@@ -202,13 +252,14 @@ func sendFileToServer(data []byte, id uint64, connection net.Conn) (err error) {
 	fileSize := fillString(strconv.FormatInt(fileInfo.Size(), 10), 10)
 	fillestringFilename := fillString(fileInfo.Name(), 64)
 
-	fmt.Println("sending name and size of temporary file ...")
+	log.Println("sending name and size of temporary file ...")
 	connection.Write([]byte(fileSize))
 
 	connection.Write([]byte(fillestringFilename))
 
 	sendBuffer := make([]byte, BUFFERSIZE)
-	fmt.Println("sending temporary ...")
+	var sentBytes int64
+	log.Println("sending temporary ...")
 	for {
 		_, err = mf.Read(sendBuffer)
 		if err == io.EOF {
@@ -217,12 +268,13 @@ func sendFileToServer(data []byte, id uint64, connection net.Conn) (err error) {
 			return err
 		}
 		connection.Write(sendBuffer)
+		sentBytes += BUFFERSIZE
 	}
-	fmt.Println("temporary file has been sent ...")
+	log.Println("storageFile file has been sent ...")
+	log.Println("file was", ByteCountSI(sentBytes), "bytes")
 	if err := mf.Close(); err != nil {
 		return err
 	}
-	fmt.Println("temporary file has been removed ...")
 	return nil
 }
 
@@ -238,11 +290,62 @@ func fillString(retunString string, toLength int) string {
 	return retunString
 }
 
-func genSonyflakeID() (id uint64, err error) {
-	flake := sonyflake.NewSonyflake(sonyflake.Settings{})
-	id, err = flake.NextID()
+func getUUID() (uuid string) {
+	return PUUID.New()
+}
+
+func deleteStorageFile() (err error) {
+	err = os.Remove(storageFile)
+	return
+}
+
+func addFiles(files Files) (err error) {
+
+	log.Println("initiating saving files to database ...")
+
+	count := len(files)
+
+	log.Println("found", count, "files")
+
+	bar := pb.StartNew(count)
+
+	tx, err := db.Begin()
 	if err != nil {
-		return 0, err
+		return err
 	}
-	return id, nil
+
+	for _, v := range files {
+		bar.Increment()
+
+		stmt, err = tx.Prepare("INSERT OR IGNORE INTO files(name, path, size, isdir, machine, ip, onexternalsource, externalname, filetype, filemime) values(?,?,?,?,?,?,?,?,?,?)")
+
+		if err != nil {
+			return err
+		}
+
+		_, err = stmt.Exec(v.Name, v.Path, v.Size, v.IsDir, v.Machine, v.IP, v.OnExternalSource, v.ExternalName, v.FileType, v.FileMIME)
+
+		if err != nil {
+			return err
+		}
+	}
+	tx.Commit()
+	bar.FinishPrint("done ...")
+
+	return nil
+
+}
+
+func ByteCountSI(b int64) string {
+	const unit = 1000
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB",
+		float64(b)/float64(div), "kMGTPE"[exp])
 }
