@@ -63,6 +63,8 @@ var (
 	targetURL    *string = flag.String("target_url", fmt.Sprintf("127.0.0.1:%d", SERVER_PORT), "the URL where gofi_server is running")
 	dryRun       *bool   = flag.Bool("dry_run", false, "set this to true if the results should be printed and NOT sent to the server")
 	externalName *string = flag.String("external_name", "n/a", "set this to a name of the external source to label it as external")
+	rootDir      *string = flag.String("root_dir", ".", "which directory to start scanning in (then searches recursively)")
+	insertLimit  *int    = flag.Int("insert_limit", 5000, "number of files to write to db")
 
 	db          *sql.DB
 	stmt        *sql.Stmt
@@ -144,15 +146,15 @@ func main() {
 	}
 	defer connection.Close()
 
-	files, err := getFiles()
+	_, err = getFiles()
 	if err != nil {
 		log.Println("error getting files", err)
 	}
 
-	err = addFiles(files)
-	if err != nil {
-		log.Println("error adding files to local db", err)
-	}
+	// err = addFiles(files)
+	// if err != nil {
+	// 	log.Println("error adding files to local db", err)
+	// }
 
 	file, err := os.Open(storageFile)
 	if err != nil {
@@ -194,7 +196,8 @@ func getFiles() (files Files, err error) {
 		tmp_on_external = 1
 	}
 	log.Println("collecting file information ...")
-	err = cwalk.Walk(".",
+	c := 0
+	err = cwalk.Walk(*rootDir,
 		func(filePath string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
@@ -215,7 +218,32 @@ func getFiles() (files Files, err error) {
 			}
 			if file.Name != "." && file.Name != ".." {
 				if !*dryRun {
+					if c > *insertLimit {
+						log.Printf("\nfound %d files. writing to db..\n", *insertLimit)
+						tx, err := db.Begin()
+						if err != nil {
+							log.Println(err)
+						}
+
+						for _, v := range files {
+							stmt, err = tx.Prepare("INSERT OR IGNORE INTO files(name, path, size, isdir, machine, ip, onexternalsource, externalname, filetype, filemime) values(?,?,?,?,?,?,?,?,?,?)")
+							if err != nil {
+								log.Println(err)
+							}
+
+							_, err = stmt.Exec(v.Name, v.Path, v.Size, v.IsDir, v.Machine, v.IP, v.OnExternalSource, v.ExternalName, v.FileType, v.FileMIME)
+
+							if err != nil {
+								log.Println(err)
+							}
+						}
+						log.Printf("\ncommitting....\n")
+						tx.Commit()
+						files = Files{}
+						c = 0
+					}
 					files = append(files, file)
+					c++
 				} else {
 					spew.Dump(file)
 				}
@@ -225,7 +253,6 @@ func getFiles() (files Files, err error) {
 	if err != nil {
 		return Files{}, err
 	}
-
 	count := len(files)
 
 	log.Println("\nfound", count, "files ...")
@@ -317,7 +344,7 @@ func addFiles(files Files) (err error) {
 	for _, v := range files {
 		bar.Increment()
 
-		stmt, err = tx.Prepare("INSERT OR IGNORE INTO files(name, path, size, isdir, machine, ip, onexternalsource, externalname, filetype, filemime) values(?,?,?,?,?,?,?,?,?,?)")
+		stmt, err = tx.Prepare("PRAGMA synchronous = OFF;INSERT OR IGNORE INTO files(name, path, size, isdir, machine, ip, onexternalsource, externalname, filetype, filemime) values(?,?,?,?,?,?,?,?,?,?)")
 
 		if err != nil {
 			return err
