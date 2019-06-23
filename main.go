@@ -18,7 +18,6 @@ import (
 	"github.com/iafan/cwalk"
 	_ "github.com/mattn/go-sqlite3"
 	PUUID "github.com/pborman/uuid"
-	pb "gopkg.in/cheggaaa/pb.v1"
 )
 
 type (
@@ -150,11 +149,6 @@ func main() {
 	if err != nil {
 		log.Println("error getting files", err)
 	}
-
-	// err = addFiles(files)
-	// if err != nil {
-	// 	log.Println("error adding files to local db", err)
-	// }
 
 	file, err := os.Open(storageFile)
 	if err != nil {
@@ -324,43 +318,6 @@ func getUUID() (uuid string) {
 func deleteStorageFile() (err error) {
 	err = os.Remove(storageFile)
 	return
-}
-
-func addFiles(files Files) (err error) {
-
-	log.Println("initiating saving files to database ...")
-
-	count := len(files)
-
-	log.Println("found", count, "files")
-
-	bar := pb.StartNew(count)
-
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-
-	for _, v := range files {
-		bar.Increment()
-
-		stmt, err = tx.Prepare("PRAGMA synchronous = OFF;INSERT OR IGNORE INTO files(name, path, size, isdir, machine, ip, onexternalsource, externalname, filetype, filemime) values(?,?,?,?,?,?,?,?,?,?)")
-
-		if err != nil {
-			return err
-		}
-
-		_, err = stmt.Exec(v.Name, v.Path, v.Size, v.IsDir, v.Machine, v.IP, v.OnExternalSource, v.ExternalName, v.FileType, v.FileMIME)
-
-		if err != nil {
-			return err
-		}
-	}
-	tx.Commit()
-	bar.FinishPrint("done ...")
-
-	return nil
-
 }
 
 func ByteCountSI(b int64) string {
