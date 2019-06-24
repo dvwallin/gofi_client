@@ -3,16 +3,20 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"time"
+	"unsafe"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/iafan/cwalk"
@@ -69,7 +73,9 @@ var (
 	stmt        *sql.Stmt
 	res         sql.Result
 	fileCount   int    = 0
-	storageFile string = fmt.Sprintf("./%s_%s", getUUID(), GOFI_DATABASE_NAME)
+	myGGUID     string = getUUID()
+	storageFile string = fmt.Sprintf("./%s_%s", myGGUID, GOFI_DATABASE_NAME)
+	tmpDir      string = fmt.Sprintf("./%s/", myGGUID)
 )
 
 func (mif myFileInfo) Name() string       { return mif.name }
@@ -90,6 +96,9 @@ func (mf *MyFile) Stat() (os.FileInfo, error) {
 }
 
 func init() {
+
+	rand.Seed(time.Now().UnixNano())
+
 	flag.Parse()
 
 	myIP, err = getIP()
@@ -102,6 +111,11 @@ func init() {
 	}
 
 	myDir, err = os.Getwd()
+	if err != nil {
+		log.Println(err)
+	}
+
+	err = CreateDirIfNotExist(myGGUID)
 	if err != nil {
 		log.Println(err)
 	}
@@ -136,6 +150,8 @@ func init() {
 		log.Printf("%q: %s\n", err, sqlStmt)
 		return
 	}
+
+	db.Close()
 }
 
 func main() {
@@ -150,6 +166,8 @@ func main() {
 		log.Println("error getting files", err)
 	}
 
+	addToTmpDB() // Adding files from JSON -files to local db
+
 	file, err := os.Open(storageFile)
 	if err != nil {
 		log.Println("error opening", storageFile, err)
@@ -162,7 +180,8 @@ func main() {
 
 	sendFileToServer(b, getUUID(), connection) // Sending file to server
 
-	deleteStorageFile() // Delete created storage file
+	deleteLoc(storageFile) // Delete created storage file
+	deleteLoc(tmpDir)      // Delete created tmp dir
 }
 
 func getIP() (ip string, err error) {
@@ -191,6 +210,8 @@ func getFiles() (files Files, err error) {
 	}
 	log.Println("collecting file information ...")
 	c := 0
+	fc := 0
+	totalCount := 0
 	err = cwalk.Walk(*rootDir,
 		func(filePath string, info os.FileInfo, err error) error {
 			if err != nil {
@@ -213,28 +234,26 @@ func getFiles() (files Files, err error) {
 			if file.Name != "." && file.Name != ".." {
 				if !*dryRun {
 					if c > *insertLimit {
-						log.Printf("\nfound %d files. writing to db..\n", *insertLimit)
-						tx, err := db.Begin()
+						jsonData, err := json.Marshal(files)
+
 						if err != nil {
-							log.Println(err)
+							panic(err)
 						}
 
-						for _, v := range files {
-							stmt, err = tx.Prepare("INSERT OR IGNORE INTO files(name, path, size, isdir, machine, ip, onexternalsource, externalname, filetype, filemime) values(?,?,?,?,?,?,?,?,?,?)")
-							if err != nil {
-								log.Println(err)
-							}
+						jsonFile, err := os.Create(fmt.Sprintf("%s%s%d.tmp.JSON", tmpDir, RandStringBytesMaskImprSrcUnsafe(5), fc))
 
-							_, err = stmt.Exec(v.Name, v.Path, v.Size, v.IsDir, v.Machine, v.IP, v.OnExternalSource, v.ExternalName, v.FileType, v.FileMIME)
-
-							if err != nil {
-								log.Println(err)
-							}
+						if err != nil {
+							panic(err)
 						}
-						log.Printf("\ncommitting....\n")
-						tx.Commit()
-						files = Files{}
+						fc++
+						defer jsonFile.Close()
+
+						jsonFile.Write(jsonData)
+						jsonFile.Close()
+						fmt.Println(len(files), "files written to ", jsonFile.Name())
+						totalCount = totalCount + len(files)
 						c = 0
+						files = Files{}
 					}
 					files = append(files, file)
 					c++
@@ -247,9 +266,6 @@ func getFiles() (files Files, err error) {
 	if err != nil {
 		return Files{}, err
 	}
-	count := len(files)
-
-	log.Println("\nfound", count, "files ...")
 
 	return files, nil
 }
@@ -315,8 +331,8 @@ func getUUID() (uuid string) {
 	return PUUID.New()
 }
 
-func deleteStorageFile() (err error) {
-	err = os.Remove(storageFile)
+func deleteLoc(path string) (err error) {
+	err = os.Remove(path)
 	return
 }
 
@@ -332,4 +348,88 @@ func ByteCountSI(b int64) string {
 	}
 	return fmt.Sprintf("%.1f %cB",
 		float64(b)/float64(div), "kMGTPE"[exp])
+}
+
+func addToTmpDB() {
+	var totalCount int = 0
+	log.Println("initiating saving files to database ...")
+
+	matches, err := filepath.Glob(fmt.Sprintf("%s*.tmp.JSON", tmpDir))
+
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	// Connect to the database
+	db, err = sql.Open("sqlite3", storageFile)
+	if err != nil {
+		log.Println(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		log.Println(err)
+	}
+
+	stmt, err = tx.Prepare("INSERT OR IGNORE INTO files(name, path, size, isdir, machine, ip, onexternalsource, externalname, filetype, filemime) values(?,?,?,?,?,?,?,?,?,?)")
+	if err != nil {
+		log.Println(err)
+	}
+
+	for _, fv := range matches {
+		jsonFile, err := os.Open(fv)
+
+		if err != nil {
+			log.Println(err)
+		}
+		fmt.Println("processing", fv, "=>", storageFile)
+		var partFiles Files
+		byteValue, _ := ioutil.ReadAll(jsonFile)
+		json.Unmarshal(byteValue, &partFiles)
+
+		for _, v := range partFiles {
+			_, err = stmt.Exec(v.Name, v.Path, v.Size, v.IsDir, v.Machine, v.IP, v.OnExternalSource, v.ExternalName, v.FileType, v.FileMIME)
+			totalCount++
+
+			if err != nil {
+				log.Println(err)
+			}
+		}
+
+		jsonFile.Close()
+	}
+	log.Printf("\ncommitting %d files....\n", totalCount)
+	tx.Commit()
+	db.Close()
+}
+
+func CreateDirIfNotExist(dir string) error {
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		err = os.MkdirAll(dir, 0755)
+		return err
+	}
+	return err
+}
+
+func RandStringBytesMaskImprSrcUnsafe(n int) string {
+	const (
+		letterBytes   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+		letterIdxBits = 6
+		letterIdxMask = 1<<letterIdxBits - 1
+		letterIdxMax  = 63 / letterIdxBits
+	)
+	var src = rand.NewSource(time.Now().UnixNano())
+	b := make([]byte, n)
+	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
+		if remain == 0 {
+			cache, remain = src.Int63(), letterIdxMax
+		}
+		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
+			b[i] = letterBytes[idx]
+			i--
+		}
+		cache >>= letterIdxBits
+		remain--
+	}
+
+	return *(*string)(unsafe.Pointer(&b))
 }
