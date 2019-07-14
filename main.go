@@ -67,8 +67,6 @@ var (
 	generatedHostname string
 	myDir             string
 	err               error
-	files             Files
-	b                 []byte
 
 	targetURL    *string = flag.String("target_url", fmt.Sprintf("127.0.0.1:%d", SERVER_PORT), "the URL where gofi_server is running")
 	dryRun       *bool   = flag.Bool("dry_run", false, "set this to true if the results should be printed and NOT sent to the server")
@@ -79,8 +77,6 @@ var (
 
 	db          *sql.DB
 	stmt        *sql.Stmt
-	res         sql.Result
-	fileCount   int    = 0
 	myGGUID     string = getUUID()
 	storageFile string = fmt.Sprintf("./%s_%s", myGGUID, GOFI_DATABASE_NAME)
 	tmpDir      string = fmt.Sprintf("./%s/", myGGUID)
@@ -138,13 +134,13 @@ func init() {
 
 	// Make sure the correct scheme exists
 	sqlStmt := `
-		CREATE TABLE IF NOT EXISTS files 
-			(	id integer NOT NULL primary key, 
-				name text NOT NULL, 
-				path text NOT NULL, 
-				size integer NOT NULL, 
-				isdir integer NOT NULL, 
-				machine text NOT NULL, 
+		CREATE TABLE IF NOT EXISTS files
+			(	id integer NOT NULL primary key,
+				name text NOT NULL,
+				path text NOT NULL,
+				size integer NOT NULL,
+				isdir integer NOT NULL,
+				machine text NOT NULL,
 				ip text NOT NULL,
 				onexternalsource integer NOT NULL,
 				externalname text NOT NULL,
@@ -193,14 +189,23 @@ func main() {
 
 	connection, err := net.Dial("tcp", *targetURL)
 	if err != nil {
-		panic(err)
+		log.Println("could not connect to server", err)
 	}
 	defer connection.Close()
 
-	sendFileToServer(b, getUUID(), connection) // Sending file to server
+	err = sendFileToServer(b, getUUID(), connection) // Sending file to server
+	if err != nil {
+		log.Println(err)
+	}
 
-	deleteLoc(storageFile) // Delete created storage file
-	deleteLoc(tmpDir)      // Delete created tmp dir
+	err = deleteLoc(storageFile) // Delete created storage file
+	if err != nil {
+		log.Println("could not remove storage file", err)
+	}
+	err = deleteLoc(tmpDir) // Delete created tmp dir
+	if err != nil {
+		log.Println("could not delete temporary directory", err)
+	}
 }
 
 func getIP() (ip string, err error) {
@@ -220,17 +225,24 @@ func getIP() (ip string, err error) {
 	return ip, nil
 }
 
+func timeTrack(start time.Time, name string) {
+	elapsed := time.Since(start)
+	log.Printf("%s took %s", name, elapsed)
+}
+
 func getFiles() (files Files, err error) {
+	defer timeTrack(time.Now(), "factorial")
 	var (
 		tmp_on_external int = 0
+		c                   = 0
+		fc                  = 0
+		totalCount          = 0
+		fileHash        string
 	)
 	if *externalName != "n/a" {
 		tmp_on_external = 1
 	}
 	log.Println("collecting file information ...")
-	c := 0
-	fc := 0
-	totalCount := 0
 
 	err = godirwalk.Walk(*rootDir, &godirwalk.Options{
 		Callback: func(filePath string, de *godirwalk.Dirent) error {
@@ -239,53 +251,32 @@ func getFiles() (files Files, err error) {
 			}
 
 			var (
-				fileHash                    string
-				modified                    string
-				isDir                       int = 0
-				fileType                    string
-				fileMime                    string
-				avoidDetailedFileProcessing bool
-				size                        int64 = 0
+				modified               string
+				isDir                  int = 0
+				fileType               string
+				fileMime               string
+				avoidFurtherProcessing bool
+				size                   int64 = 0
 			)
 			if de.IsDir() {
 				isDir = 1
 			}
-			if isDir < 1 {
-				myFile, err := os.Open(filePath)
-				if err != nil {
-					log.Printf("failed to open the file: %v", err)
-					avoidDetailedFileProcessing = true
-				}
-				defer myFile.Close()
-				if !avoidDetailedFileProcessing {
-					key, err := hex.DecodeString(GOFI_DEC_KEY)
-					if err != nil {
-						log.Printf("cannot decode hex key: %v", err)
-					}
-					hash, err := highwayhash.New(key)
-					if err != nil {
-						log.Printf("failed to create HighwayHash instance: %v", err)
-					}
-					if _, err = io.Copy(hash, myFile); err != nil {
-						log.Printf("failed to read from file: %v", err)
-					}
+			if isDir == 0 {
+
+				if !avoidFurtherProcessing {
+					fileType, fileMime, fileHash, avoidFurtherProcessing = extractTypeMime(filePath)
 
 					stat, err := os.Stat(filePath)
-					spew.Dump(stat)
+
 					if err != nil {
 						log.Println(err)
+						avoidFurtherProcessing = true
 					}
-					fileHash = hex.EncodeToString(hash.Sum(nil))
-					modified = fmt.Sprintf("%s", stat.ModTime())
-					buf, _ := ioutil.ReadFile(filePath)
 
-					kind, _ := filetype.Match(buf)
-					if kind == filetype.Unknown {
-						log.Println("Unknown file type")
+					if !avoidFurtherProcessing {
+						modified = stat.ModTime().String()
+						size = stat.Size()
 					}
-					fileType = kind.Extension
-					fileMime = http.DetectContentType(buf)
-					size = stat.Size()
 				}
 			}
 			file := File{
@@ -302,8 +293,7 @@ func getFiles() (files Files, err error) {
 				FileHash:         fileHash,
 				Modified:         modified,
 			}
-			spew.Dump(file)
-			return nil
+
 			if file.Name != "." && file.Name != ".." {
 				if !*dryRun {
 					if c > *insertLimit {
@@ -321,7 +311,10 @@ func getFiles() (files Files, err error) {
 						fc++
 						defer jsonFile.Close()
 
-						jsonFile.Write(jsonData)
+						_, err = jsonFile.Write(jsonData)
+						if err != nil {
+							log.Println(err)
+						}
 						jsonFile.Close()
 						fmt.Println(len(files), "files written to ", jsonFile.Name())
 						log.Println(len(files), "files written to ", jsonFile.Name())
@@ -346,6 +339,33 @@ func getFiles() (files Files, err error) {
 	return files, nil
 }
 
+func extractTypeMime(filePath string) (fileType string, fileMime string, fileHash string, avoidFurtherProcessing bool) {
+	myFile, err := os.Open(filePath)
+	if err != nil {
+		log.Printf("failed to open the file: %v", err)
+		avoidFurtherProcessing = true
+	}
+	defer myFile.Close()
+	key, err := hex.DecodeString(GOFI_DEC_KEY)
+	if err != nil {
+		log.Printf("cannot decode hex key: %v", err)
+	}
+	hash, err := highwayhash.New(key)
+	if err != nil {
+		log.Printf("failed to create HighwayHash instance: %v", err)
+	}
+	if _, err = io.Copy(hash, myFile); err != nil {
+		log.Printf("failed to read from file: %v", err)
+	}
+	fileHash = hex.EncodeToString(hash.Sum(nil))
+	buf, _ := ioutil.ReadFile(filePath)
+
+	kind, _ := filetype.Match(buf)
+	fileType = kind.Extension
+	fileMime = http.DetectContentType(buf)
+	return fileType, fileMime, fileHash, avoidFurtherProcessing
+}
+
 func sendFileToServer(data []byte, id string, connection net.Conn) (err error) {
 	defer connection.Close()
 
@@ -366,9 +386,15 @@ func sendFileToServer(data []byte, id string, connection net.Conn) (err error) {
 	fillestringFilename := fillString(fileInfo.Name(), 64)
 
 	log.Println("sending name and size of temporary file ...")
-	connection.Write([]byte(fileSize))
+	_, err = connection.Write([]byte(fileSize))
+	if err != nil {
+		log.Println(err)
+	}
 
-	connection.Write([]byte(fillestringFilename))
+	_, err = connection.Write([]byte(fillestringFilename))
+	if err != nil {
+		log.Println(err)
+	}
 
 	sendBuffer := make([]byte, BUFFERSIZE)
 	var sentBytes int64
@@ -380,7 +406,10 @@ func sendFileToServer(data []byte, id string, connection net.Conn) (err error) {
 		} else if err != nil {
 			return err
 		}
-		connection.Write(sendBuffer)
+		_, err = connection.Write(sendBuffer)
+		if err != nil {
+			log.Println(err)
+		}
 		sentBytes += BUFFERSIZE
 	}
 	log.Println("storageFile file has been sent ...")
@@ -460,7 +489,10 @@ func addToTmpDB() {
 		fmt.Println("processing", fv, "=>", storageFile)
 		var partFiles Files
 		byteValue, _ := ioutil.ReadAll(jsonFile)
-		json.Unmarshal(byteValue, &partFiles)
+		err = json.Unmarshal(byteValue, &partFiles)
+		if err != nil {
+			log.Println(err)
+		}
 
 		for _, v := range partFiles {
 			_, err = stmt.Exec(v.Name, v.Path, v.Size, v.IsDir, v.Machine, v.IP, v.OnExternalSource, v.ExternalName, v.FileType, v.FileMIME, v.FileHash, v.Modified)
@@ -474,7 +506,10 @@ func addToTmpDB() {
 		jsonFile.Close()
 	}
 	log.Printf("\ncommitting %d files....\n", totalCount)
-	tx.Commit()
+	err = tx.Commit()
+	if err != nil {
+		log.Println(err)
+	}
 	db.Close()
 }
 
