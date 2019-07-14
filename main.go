@@ -12,15 +12,16 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"time"
 	"unsafe"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/iafan/cwalk"
+	"github.com/h2non/filetype"
+	"github.com/karrick/godirwalk"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/minio/highwayhash"
 	PUUID "github.com/pborman/uuid"
@@ -58,6 +59,7 @@ const (
 	SERVER_PORT        = 1985
 	GOFI_DATABASE_NAME = "gofi.db"
 	GOFI_DEC_KEY       = "000102030405060708090A0B0C0D0E0FF0E0D0C0B0A090807060504030201000"
+	GOFI_LOG_FILE      = "gofi.log"
 )
 
 var (
@@ -163,11 +165,14 @@ func init() {
 }
 
 func main() {
-	connection, err := net.Dial("tcp", *targetURL)
+	f, err := os.OpenFile(GOFI_LOG_FILE, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
-		panic(err)
+		log.Fatalf("error opening file: %v", err)
 	}
-	defer connection.Close()
+	defer f.Close()
+
+	log.SetOutput(f)
+	log.Printf("--\ninitiating gofi client..\n--\n\n")
 
 	_, err = getFiles()
 	if err != nil {
@@ -185,6 +190,12 @@ func main() {
 	if err != nil {
 		log.Println("error reading", storageFile, err)
 	}
+
+	connection, err := net.Dial("tcp", *targetURL)
+	if err != nil {
+		panic(err)
+	}
+	defer connection.Close()
 
 	sendFileToServer(b, getUUID(), connection) // Sending file to server
 
@@ -220,48 +231,79 @@ func getFiles() (files Files, err error) {
 	c := 0
 	fc := 0
 	totalCount := 0
-	err = cwalk.Walk(*rootDir,
-		func(filePath string, info os.FileInfo, err error) error {
+
+	err = godirwalk.Walk(*rootDir, &godirwalk.Options{
+		Callback: func(filePath string, de *godirwalk.Dirent) error {
 			if err != nil {
 				return err
 			}
-			filePath = path.Join(myDir, filePath)
-			myFile, err := os.Open(filePath)
-			if err != nil {
-				log.Printf("failed to open the file: %v", err)
-			}
-			defer myFile.Close()
 
-			stat, err := os.Stat(filePath)
-			if err != nil {
-				log.Println(err)
+			var (
+				fileHash                    string
+				modified                    string
+				isDir                       int = 0
+				fileType                    string
+				fileMime                    string
+				avoidDetailedFileProcessing bool
+				size                        int64 = 0
+			)
+			if de.IsDir() {
+				isDir = 1
 			}
-			key, err := hex.DecodeString(GOFI_DEC_KEY)
-			if err != nil {
-				log.Printf("cannot decode hex key: %v", err)
-			}
-			hash, err := highwayhash.New(key)
-			if err != nil {
-				log.Printf("failed to create HighwayHash instance: %v", err)
-			}
-			if _, err = io.Copy(hash, myFile); err != nil {
-				log.Printf("failed to read from file: %v", err)
+			if isDir < 1 {
+				myFile, err := os.Open(filePath)
+				if err != nil {
+					log.Printf("failed to open the file: %v", err)
+					avoidDetailedFileProcessing = true
+				}
+				defer myFile.Close()
+				if !avoidDetailedFileProcessing {
+					key, err := hex.DecodeString(GOFI_DEC_KEY)
+					if err != nil {
+						log.Printf("cannot decode hex key: %v", err)
+					}
+					hash, err := highwayhash.New(key)
+					if err != nil {
+						log.Printf("failed to create HighwayHash instance: %v", err)
+					}
+					if _, err = io.Copy(hash, myFile); err != nil {
+						log.Printf("failed to read from file: %v", err)
+					}
+
+					stat, err := os.Stat(filePath)
+					spew.Dump(stat)
+					if err != nil {
+						log.Println(err)
+					}
+					fileHash = hex.EncodeToString(hash.Sum(nil))
+					modified = fmt.Sprintf("%s", stat.ModTime())
+					buf, _ := ioutil.ReadFile(filePath)
+
+					kind, _ := filetype.Match(buf)
+					if kind == filetype.Unknown {
+						log.Println("Unknown file type")
+					}
+					fileType = kind.Extension
+					fileMime = http.DetectContentType(buf)
+					size = stat.Size()
+				}
 			}
 			file := File{
-				Name:             info.Name(),
+				Name:             de.Name(),
 				Path:             filePath,
-				Size:             info.Size(),
+				Size:             size,
 				Machine:          *hostname,
 				IsDir:            0,
 				IP:               myIP,
 				OnExternalSource: tmp_on_external,
 				ExternalName:     *externalName,
-				FileHash:         hex.EncodeToString(hash.Sum(nil)),
-				Modified:         fmt.Sprintf("%s", stat.ModTime()),
+				FileType:         fileType,
+				FileMIME:         fileMime,
+				FileHash:         fileHash,
+				Modified:         modified,
 			}
-			if info.IsDir() {
-				file.IsDir = 1
-			}
+			spew.Dump(file)
+			return nil
 			if file.Name != "." && file.Name != ".." {
 				if !*dryRun {
 					if c > *insertLimit {
@@ -282,6 +324,7 @@ func getFiles() (files Files, err error) {
 						jsonFile.Write(jsonData)
 						jsonFile.Close()
 						fmt.Println(len(files), "files written to ", jsonFile.Name())
+						log.Println(len(files), "files written to ", jsonFile.Name())
 						totalCount = totalCount + len(files)
 						c = 0
 						files = Files{}
@@ -293,7 +336,9 @@ func getFiles() (files Files, err error) {
 				}
 			}
 			return nil
-		})
+		},
+		Unsorted: true, // (optional) set true for faster yet non-deterministic enumeration (see godoc)
+	})
 	if err != nil {
 		return Files{}, err
 	}
@@ -401,7 +446,7 @@ func addToTmpDB() {
 		log.Println(err)
 	}
 
-	stmt, err = tx.Prepare("INSERT OR IGNORE INTO files(name, path, size, isdir, machine, ip, onexternalsource, externalname, filetype, filemime) values(?,?,?,?,?,?,?,?,?,?)")
+	stmt, err = tx.Prepare("INSERT OR IGNORE INTO files(name, path, size, isdir, machine, ip, onexternalsource, externalname, filetype, filemime, filehash, modified) values(?,?,?,?,?,?,?,?,?,?,?,?)")
 	if err != nil {
 		log.Println(err)
 	}
@@ -418,7 +463,7 @@ func addToTmpDB() {
 		json.Unmarshal(byteValue, &partFiles)
 
 		for _, v := range partFiles {
-			_, err = stmt.Exec(v.Name, v.Path, v.Size, v.IsDir, v.Machine, v.IP, v.OnExternalSource, v.ExternalName, v.FileType, v.FileMIME)
+			_, err = stmt.Exec(v.Name, v.Path, v.Size, v.IsDir, v.Machine, v.IP, v.OnExternalSource, v.ExternalName, v.FileType, v.FileMIME, v.FileHash, v.Modified)
 			totalCount++
 
 			if err != nil {
