@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/iafan/cwalk"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/minio/highwayhash"
 	PUUID "github.com/pborman/uuid"
 )
 
@@ -37,6 +39,8 @@ type (
 		ExternalName     string `json:"external_name"`
 		FileType         string `json:"file_type"`
 		FileMIME         string `json:"file_mime"`
+		FileHash         string `json:"file_hash"`
+		Modified         string `json:"modified"`
 	}
 	Files      []File
 	myFileInfo struct {
@@ -53,21 +57,23 @@ const (
 	BUFFERSIZE         = 2048
 	SERVER_PORT        = 1985
 	GOFI_DATABASE_NAME = "gofi.db"
+	GOFI_DEC_KEY       = "000102030405060708090A0B0C0D0E0FF0E0D0C0B0A090807060504030201000"
 )
 
 var (
-	myIP       string
-	myHostname string
-	myDir      string
-	err        error
-	files      Files
-	b          []byte
+	myIP              string
+	generatedHostname string
+	myDir             string
+	err               error
+	files             Files
+	b                 []byte
 
 	targetURL    *string = flag.String("target_url", fmt.Sprintf("127.0.0.1:%d", SERVER_PORT), "the URL where gofi_server is running")
 	dryRun       *bool   = flag.Bool("dry_run", false, "set this to true if the results should be printed and NOT sent to the server")
 	externalName *string = flag.String("external_name", "n/a", "set this to a name of the external source to label it as external")
 	rootDir      *string = flag.String("root_dir", ".", "which directory to start scanning in (then searches recursively)")
 	insertLimit  *int    = flag.Int("insert_limit", 5000, "number of files to write to db")
+	hostname     *string = flag.String("hostname", generatedHostname, "manually declare the hostname of the index")
 
 	db          *sql.DB
 	stmt        *sql.Stmt
@@ -105,7 +111,7 @@ func init() {
 	if err != nil {
 		log.Println("error getting client IP", err)
 	}
-	myHostname, err = os.Hostname()
+	generatedHostname, err = os.Hostname()
 	if err != nil {
 		log.Println("error getting client hostname", err)
 	}
@@ -142,7 +148,9 @@ func init() {
 				externalname text NOT NULL,
 				filetype text NOT NULL,
 				filemime text NOT NULL,
-			CONSTRAINT path_unique UNIQUE (path, machine, ip, onexternalsource, externalname)
+        filehash text NOT NULL,
+        modified text NOT NULL,
+			CONSTRAINT path_unique UNIQUE (path, machine, ip, onexternalsource, externalname, filehash)
 			);
 	`
 	_, err = db.Exec(sqlStmt)
@@ -218,15 +226,38 @@ func getFiles() (files Files, err error) {
 				return err
 			}
 			filePath = path.Join(myDir, filePath)
+			myFile, err := os.Open(filePath)
+			if err != nil {
+				log.Printf("failed to open the file: %v", err)
+			}
+			defer myFile.Close()
+
+			stat, err := os.Stat(filePath)
+			if err != nil {
+				log.Println(err)
+			}
+			key, err := hex.DecodeString(GOFI_DEC_KEY)
+			if err != nil {
+				log.Printf("cannot decode hex key: %v", err)
+			}
+			hash, err := highwayhash.New(key)
+			if err != nil {
+				log.Printf("failed to create HighwayHash instance: %v", err)
+			}
+			if _, err = io.Copy(hash, myFile); err != nil {
+				log.Printf("failed to read from file: %v", err)
+			}
 			file := File{
 				Name:             info.Name(),
 				Path:             filePath,
 				Size:             info.Size(),
-				Machine:          myHostname,
+				Machine:          *hostname,
 				IsDir:            0,
 				IP:               myIP,
 				OnExternalSource: tmp_on_external,
 				ExternalName:     *externalName,
+				FileHash:         hex.EncodeToString(hash.Sum(nil)),
+				Modified:         fmt.Sprintf("%s", stat.ModTime()),
 			}
 			if info.IsDir() {
 				file.IsDir = 1
@@ -237,13 +268,13 @@ func getFiles() (files Files, err error) {
 						jsonData, err := json.Marshal(files)
 
 						if err != nil {
-							panic(err)
+							log.Println(err)
 						}
 
 						jsonFile, err := os.Create(fmt.Sprintf("%s%s%d.tmp.JSON", tmpDir, RandStringBytesMaskImprSrcUnsafe(5), fc))
 
 						if err != nil {
-							panic(err)
+							log.Println(err)
 						}
 						fc++
 						defer jsonFile.Close()
