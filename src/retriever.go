@@ -1,85 +1,81 @@
 package src
 
 import (
-	"fmt"
+	"encoding/hex"
+	"io"
+	"io/ioutil"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
-	"time"
+	"sync/atomic"
 
-	"github.com/dvwallin/gofi_client/src"
-	"github.com/karrick/godirwalk"
+	"github.com/dvwallin/gofi_client/objects"
+	"github.com/h2non/filetype"
+	"github.com/minio/highwayhash"
 )
 
-func GetFiles() (err error) {
+var fileSlice []*objects.File
+var errorCount int32
+var rootPath string
+var retrieverObject objects.Retriever
 
-	var allFiles Files
+func GetFiles(retriever objects.Retriever) []*objects.File {
+	retrieverObject = retriever
+	err := filepath.Walk(retrieverObject.RootDir, callback)
+	Log(err, "")
+	return fileSlice
+}
 
-	// using the TimeTrack function to meassure the time it took to execute
-	// the file-fetching-function
-	defer src.TimeTrack(time.Now(), "factorial")
-
-	// initiating the variables needed for this function. some claim
-	// we should short-hand -initiate variables as close to use
-	// as possible but this looks pretty
-	var (
-		// tmp_on_external int = 0
-		totalCount = 0
-		// fileHash        string
-		//		locFiles Files
-		c = 0
-	)
-
-	// if externalName flag is not empty we want to flag the file
-	// as located on an external drive
-	// if *externalName != "" {
-	// 	tmp_on_external = 1
-	// }
-
-	// some ui-logging
-	src.Log(nil, "collecting file information ...")
-
-	err = godirwalk.Walk(*rootDir, &godirwalk.Options{
-		Callback: func(filePath string, de *godirwalk.Dirent) error {
-			if err != nil {
-				return err
+func callback(path string, info os.FileInfo, err error) error {
+	if err != nil {
+		atomic.AddInt32(&errorCount, 1)
+		return err
+	} else {
+		if !info.IsDir() && info.Mode().IsRegular() {
+			external := 0
+			if retrieverObject.ExternalName != "" {
+				external = 1
 			}
-			split := strings.Split(filePath, "/")
-			file := File{
-				Name:  split[len(split)-1],
-				Path:  strings.Replace(filePath, split[len(split)-1], "", -1),
-				IsDir: src.IsDirAsInt(de.IsDir()),
+			fullpath := strings.Replace(path, info.Name(), "", -1)
+			filetype, filemime, filehash := extractTypeMime(path)
+			file := objects.File{
+				Name:             info.Name(),
+				Path:             fullpath,
+				Modified:         info.ModTime().String(),
+				IsDir:            0,
+				Machine:          retrieverObject.Hostname,
+				OnExternalSource: external,
+				ExternalName:     retrieverObject.ExternalName,
+				FileType:         filetype,
+				FileMIME:         filemime,
+				FileHash:         filehash,
+				Size:             info.Size(),
 			}
-			if !*dryRun {
-				allFiles = append(allFiles, file)
-				if c > 4999 {
-					src.Log(nil, fmt.Sprintf("found %dk files", totalCount))
-					c = 0
-				}
-				totalCount++
-				c++
-				// jsonData, err := json.Marshal(file)
 
-				// if err != nil {
-				// 	log.Println(err)
-				// }
-
-				// jsonFile, err := os.Create(fmt.Sprintf("%s%s.tmp.JSON", tmpDir, helpers.RandStringBytesMaskImprSrcUnsafe(15)))
-
-				// if err != nil {
-				// 	log.Println(err)
-				// }
-				// defer jsonFile.Close()
-
-				// _, err = jsonFile.Write(jsonData)
-				// if err != nil {
-				// 	log.Println(err)
-				// }
-				// jsonFile.Close()
-			}
-			return nil
-		},
-		Unsorted: true, // (optional) set true for faster yet non-deterministic enumeration (see godoc)
-	})
-	src.Log(err, "")
-
+			fileSlice = append(fileSlice, &file)
+		}
+	}
 	return nil
+}
+
+func extractTypeMime(filePath string) (fileType string, fileMime string, fileHash string) {
+	if _, err := os.Stat(filePath); err == nil {
+		const GOFI_DEC_KEY = "000102030405060708090A0B0C0D0E0FF0E0D0C0B0A090807060504030201000"
+		myFile, err := os.Open(filePath)
+		Log(err, "")
+		defer myFile.Close()
+		key, err := hex.DecodeString(GOFI_DEC_KEY)
+		Log(err, "")
+		hash, err := highwayhash.New(key)
+		Log(err, "")
+		_, err = io.Copy(hash, myFile)
+		Log(err, "")
+		fileHash = hex.EncodeToString(hash.Sum(nil))
+		buf, _ := ioutil.ReadFile(filePath)
+		kind, _ := filetype.Match(buf)
+		fileType = kind.Extension
+		fileMime = http.DetectContentType(buf)
+	}
+	return fileType, fileMime, fileHash
 }
