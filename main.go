@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,19 +11,14 @@ import (
 	"log"
 	"math/rand"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"strconv"
 	"time"
-	"unsafe"
 
-	"github.com/davecgh/go-spew/spew"
-	"github.com/h2non/filetype"
-	"github.com/karrick/godirwalk"
+	"github.com/dvwallin/gofi_client/src"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/minio/highwayhash"
-	PUUID "github.com/pborman/uuid"
 )
 
 type (
@@ -68,31 +62,34 @@ var (
 	myDir             string
 	err               error
 
-	targetURL    *string = flag.String("target_url", fmt.Sprintf("127.0.0.1:%d", SERVER_PORT), "the URL where gofi_server is running")
-	dryRun       *bool   = flag.Bool("dry_run", false, "set this to true if the results should be printed and NOT sent to the server")
-	externalName *string = flag.String("external_name", "n/a", "set this to a name of the external source to label it as external")
-	rootDir      *string = flag.String("root_dir", ".", "which directory to start scanning in (then searches recursively)")
-	insertLimit  *int    = flag.Int("insert_limit", 5000, "number of files to write to db")
-	hostname     *string = flag.String("hostname", generatedHostname, "manually declare the hostname of the index")
+	targetURL *string = flag.String("target_url", fmt.Sprintf("127.0.0.1:%d", SERVER_PORT), "the URL where gofi_server is running")
+	//	externalName *string = flag.String("external_name", "", "set this to a name of the external source to label it as external")
+	rootDir *string = flag.String("root_dir", ".", "which directory to start scanning in (then searches recursively)")
+	//	hostname     *string = flag.String("hostname", generatedHostname, "manually declare the hostname of the index")
+
+	// debug-related flags
+	dryRun  *bool   = flag.Bool("dry_run", false, "set this to true if the results should be printed and NOT sent to the server")
+	cpuprof *string = flag.String("cpuprof", "", "the name of the cpuprof file")
+	memprof *string = flag.String("memprof", "", "the name of the memprof file")
 
 	db          *sql.DB
 	stmt        *sql.Stmt
-	myGGUID     string = getUUID()
+	myGGUID     string = src.GetUUID()
 	storageFile string = fmt.Sprintf("./%s_%s", myGGUID, GOFI_DATABASE_NAME)
 	tmpDir      string = fmt.Sprintf("./%s/", myGGUID)
 )
 
 func (mif myFileInfo) Name() string       { return mif.name }
 func (mif myFileInfo) Size() int64        { return int64(len(mif.data)) }
-func (mif myFileInfo) Mode() os.FileMode  { return 0444 }        // Read for all
-func (mif myFileInfo) ModTime() time.Time { return time.Time{} } // Return anything
+func (mif myFileInfo) Mode() os.FileMode  { return 0444 }
+func (mif myFileInfo) ModTime() time.Time { return time.Time{} }
 func (mif myFileInfo) IsDir() bool        { return false }
 func (mif myFileInfo) Sys() interface{}   { return nil }
 
-func (mf *MyFile) Close() error { return nil } // Noop, nothing to do
+func (mf *MyFile) Close() error { return nil }
 
 func (mf *MyFile) Readdir(count int) ([]os.FileInfo, error) {
-	return nil, nil // We are not a directory but a single file
+	return nil, nil // not a directory but a single file
 }
 
 func (mf *MyFile) Stat() (os.FileInfo, error) {
@@ -101,38 +98,31 @@ func (mf *MyFile) Stat() (os.FileInfo, error) {
 
 func init() {
 
+	// initial random shite like creating a seed for later randomization
+	// or parsing attribute flags
 	rand.Seed(time.Now().UnixNano())
-
 	flag.Parse()
 
-	myIP, err = getIP()
-	if err != nil {
-		log.Println("error getting client IP", err)
-	}
+	// fetching data for later use, such as ip, hostname, etc
+	myIP, err = src.GetIP()
+	src.Log(err, "")
+
 	generatedHostname, err = os.Hostname()
-	if err != nil {
-		log.Println("error getting client hostname", err)
-	}
+	src.Log(err, "")
 
 	myDir, err = os.Getwd()
-	if err != nil {
-		log.Println(err)
-	}
+	src.Log(err, "")
 
-	err = CreateDirIfNotExist(myGGUID)
-	if err != nil {
-		log.Println(err)
-	}
+	err = src.CreateDirIfNotExist(myGGUID)
+	src.Log(err, "")
 
 	log.Println("connecting to", storageFile)
 
-	// Connect to the database
+	// connecting to database
 	db, err = sql.Open("sqlite3", storageFile)
-	if err != nil {
-		log.Println(err)
-	}
+	src.Log(err, "")
 
-	// Make sure the correct scheme exists
+	// our schema for the temporary database
 	sqlStmt := `
 		CREATE TABLE IF NOT EXISTS files
 			(	id integer NOT NULL primary key,
@@ -152,219 +142,85 @@ func init() {
 			);
 	`
 	_, err = db.Exec(sqlStmt)
-	if err != nil {
-		log.Printf("%q: %s\n", err, sqlStmt)
-		return
-	}
+	src.Log(err, "")
 
 	db.Close()
 }
 
 func main() {
+
+	// when developing we might want profiling for cpu and/or memory.
+	// by using the -cpuprof or -memprof argument flags we can generate
+	// profiles for debugging.
+	initiateProf()
+
+	// putting all logging into a log file instead
 	f, err := os.OpenFile(GOFI_LOG_FILE, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatalf("error opening file: %v", err)
-	}
+	src.Log(err, "")
 	defer f.Close()
-
 	log.SetOutput(f)
-	log.Printf("--\ninitiating gofi client..\n--\n\n")
 
-	_, err = getFiles()
-	if err != nil {
-		log.Println("error getting files", err)
-	}
+	// running through all files, in the rootDir, recursively
+	// and fetches metadata of each file
+	err = getFiles()
+	src.Log(err, "")
 
-	addToTmpDB() // Adding files from JSON -files to local db
+	// addToTmpDB() // Adding files from JSON -files to local db
 
+	// opening the storageFile which is later used for temporarily storing
+	// all found files
 	file, err := os.Open(storageFile)
-	if err != nil {
-		log.Println("error opening", storageFile, err)
-	}
+	src.Log(err, "")
 
+	// lets byte the hell out of the storageFile !!
 	b, err := ioutil.ReadAll(file)
-	if err != nil {
-		log.Println("error reading", storageFile, err)
-	}
+	src.Log(err, "")
 
+	// now we should have all the files and an open storageFile
+	// so let's connect to the server so we can send over the data
 	connection, err := net.Dial("tcp", *targetURL)
-	if err != nil {
-		log.Println("could not connect to server", err)
-	}
+	src.Log(err, "")
 	defer connection.Close()
 
-	err = sendFileToServer(b, getUUID(), connection) // Sending file to server
-	if err != nil {
-		log.Println(err)
-	}
+	// sending the files to the server for more permanent storage
+	err = sendFileToServer(b, src.GetUUID(), connection)
+	src.Log(err, "")
 
-	err = deleteLoc(storageFile) // Delete created storage file
-	if err != nil {
-		log.Println("could not remove storage file", err)
-	}
-	err = deleteLoc(tmpDir) // Delete created tmp dir
-	if err != nil {
-		log.Println("could not delete temporary directory", err)
-	}
+	// time to delete the temporary directory and the temporare storageFile
+	// since it should all have sent to the server by now
+	err = src.Remove(storageFile)
+	src.Log(err, "")
+	err = src.Remove(tmpDir)
+	src.Log(err, "")
+
 }
 
-func getIP() (ip string, err error) {
-	ip = "unknown"
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return ip, err
-	}
+// func extractTypeMime(filePath string) (fileType string, fileMime string, fileHash string, avoidFurtherProcessing bool) {
+// 	myFile, err := os.Open(filePath)
+// 	if err != nil {
+// 		log.Printf("failed to open the file: %v", err)
+// 		avoidFurtherProcessing = true
+// 	}
+// 	defer myFile.Close()
+// 	key, err := hex.DecodeString(GOFI_DEC_KEY)
+// 	if err != nil {
+// 		log.Printf("cannot decode hex key: %v", err)
+// 	}
+// 	hash, err := highwayhash.New(key)
+// 	if err != nil {
+// 		log.Printf("failed to create HighwayHash instance: %v", err)
+// 	}
+// 	if _, err = io.Copy(hash, myFile); err != nil {
+// 		log.Printf("failed to read from file: %v", err)
+// 	}
+// 	fileHash = hex.EncodeToString(hash.Sum(nil))
+// 	buf, _ := ioutil.ReadFile(filePath)
 
-	for _, a := range addrs {
-		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				ip = ipnet.IP.String()
-			}
-		}
-	}
-	return ip, nil
-}
-
-func timeTrack(start time.Time, name string) {
-	elapsed := time.Since(start)
-	log.Printf("%s took %s", name, elapsed)
-}
-
-func getFiles() (files Files, err error) {
-	defer timeTrack(time.Now(), "factorial")
-	var (
-		tmp_on_external int = 0
-		c                   = 0
-		fc                  = 0
-		totalCount          = 0
-		fileHash        string
-	)
-	if *externalName != "n/a" {
-		tmp_on_external = 1
-	}
-	log.Println("collecting file information ...")
-
-	err = godirwalk.Walk(*rootDir, &godirwalk.Options{
-		Callback: func(filePath string, de *godirwalk.Dirent) error {
-			if err != nil {
-				return err
-			}
-
-			var (
-				modified               string
-				isDir                  int = 0
-				fileType               string
-				fileMime               string
-				avoidFurtherProcessing bool
-				size                   int64 = 0
-			)
-			if de.IsDir() {
-				isDir = 1
-			}
-			if isDir == 0 {
-
-				if !avoidFurtherProcessing {
-					fileType, fileMime, fileHash, avoidFurtherProcessing = extractTypeMime(filePath)
-
-					stat, err := os.Stat(filePath)
-
-					if err != nil {
-						log.Println(err)
-						avoidFurtherProcessing = true
-					}
-
-					if !avoidFurtherProcessing {
-						modified = stat.ModTime().String()
-						size = stat.Size()
-					}
-				}
-			}
-			file := File{
-				Name:             de.Name(),
-				Path:             filePath,
-				Size:             size,
-				Machine:          *hostname,
-				IsDir:            0,
-				IP:               myIP,
-				OnExternalSource: tmp_on_external,
-				ExternalName:     *externalName,
-				FileType:         fileType,
-				FileMIME:         fileMime,
-				FileHash:         fileHash,
-				Modified:         modified,
-			}
-
-			if file.Name != "." && file.Name != ".." {
-				if !*dryRun {
-					if c > *insertLimit {
-						jsonData, err := json.Marshal(files)
-
-						if err != nil {
-							log.Println(err)
-						}
-
-						jsonFile, err := os.Create(fmt.Sprintf("%s%s%d.tmp.JSON", tmpDir, RandStringBytesMaskImprSrcUnsafe(5), fc))
-
-						if err != nil {
-							log.Println(err)
-						}
-						fc++
-						defer jsonFile.Close()
-
-						_, err = jsonFile.Write(jsonData)
-						if err != nil {
-							log.Println(err)
-						}
-						jsonFile.Close()
-						fmt.Println(len(files), "files written to ", jsonFile.Name())
-						log.Println(len(files), "files written to ", jsonFile.Name())
-						totalCount = totalCount + len(files)
-						c = 0
-						files = Files{}
-					}
-					files = append(files, file)
-					c++
-				} else {
-					spew.Dump(file)
-				}
-			}
-			return nil
-		},
-		Unsorted: true, // (optional) set true for faster yet non-deterministic enumeration (see godoc)
-	})
-	if err != nil {
-		return Files{}, err
-	}
-
-	return files, nil
-}
-
-func extractTypeMime(filePath string) (fileType string, fileMime string, fileHash string, avoidFurtherProcessing bool) {
-	myFile, err := os.Open(filePath)
-	if err != nil {
-		log.Printf("failed to open the file: %v", err)
-		avoidFurtherProcessing = true
-	}
-	defer myFile.Close()
-	key, err := hex.DecodeString(GOFI_DEC_KEY)
-	if err != nil {
-		log.Printf("cannot decode hex key: %v", err)
-	}
-	hash, err := highwayhash.New(key)
-	if err != nil {
-		log.Printf("failed to create HighwayHash instance: %v", err)
-	}
-	if _, err = io.Copy(hash, myFile); err != nil {
-		log.Printf("failed to read from file: %v", err)
-	}
-	fileHash = hex.EncodeToString(hash.Sum(nil))
-	buf, _ := ioutil.ReadFile(filePath)
-
-	kind, _ := filetype.Match(buf)
-	fileType = kind.Extension
-	fileMime = http.DetectContentType(buf)
-	return fileType, fileMime, fileHash, avoidFurtherProcessing
-}
+// 	kind, _ := filetype.Match(buf)
+// 	fileType = kind.Extension
+// 	fileMime = http.DetectContentType(buf)
+// 	return fileType, fileMime, fileHash, avoidFurtherProcessing
+// }
 
 func sendFileToServer(data []byte, id string, connection net.Conn) (err error) {
 	defer connection.Close()
@@ -382,8 +238,8 @@ func sendFileToServer(data []byte, id string, connection net.Conn) (err error) {
 		return err
 	}
 
-	fileSize := fillString(strconv.FormatInt(fileInfo.Size(), 10), 10)
-	fillestringFilename := fillString(fileInfo.Name(), 64)
+	fileSize := src.FillString(strconv.FormatInt(fileInfo.Size(), 10), 10)
+	fillestringFilename := src.FillString(fileInfo.Name(), 64)
 
 	log.Println("sending name and size of temporary file ...")
 	_, err = connection.Write([]byte(fileSize))
@@ -413,46 +269,11 @@ func sendFileToServer(data []byte, id string, connection net.Conn) (err error) {
 		sentBytes += BUFFERSIZE
 	}
 	log.Println("storageFile file has been sent ...")
-	log.Println("file was", ByteCountSI(sentBytes), "bytes")
+	log.Println("file was", src.ByteCountSI(sentBytes), "bytes")
 	if err := mf.Close(); err != nil {
 		return err
 	}
 	return nil
-}
-
-func fillString(retunString string, toLength int) string {
-	for {
-		lengtString := len(retunString)
-		if lengtString < toLength {
-			retunString = retunString + ":"
-			continue
-		}
-		break
-	}
-	return retunString
-}
-
-func getUUID() (uuid string) {
-	return PUUID.New()
-}
-
-func deleteLoc(path string) (err error) {
-	err = os.Remove(path)
-	return
-}
-
-func ByteCountSI(b int64) string {
-	const unit = 1000
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB",
-		float64(b)/float64(div), "kMGTPE"[exp])
 }
 
 func addToTmpDB() {
@@ -513,34 +334,90 @@ func addToTmpDB() {
 	db.Close()
 }
 
-func CreateDirIfNotExist(dir string) error {
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		err = os.MkdirAll(dir, 0755)
-		return err
+func initiateProf() {
+	if *cpuprof != "" {
+		prof, err := os.Create("cpu.prof")
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = pprof.StartCPUProfile(prof)
+		if err != nil {
+			panic(err)
+		}
+		defer pprof.StopCPUProfile()
 	}
-	return err
+
+	if *memprof != "" {
+		f, err := os.Create(*memprof)
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = pprof.WriteHeapProfile(f)
+		if err != nil {
+			panic(err)
+		}
+		f.Close()
+		return
+	}
 }
 
-func RandStringBytesMaskImprSrcUnsafe(n int) string {
-	const (
-		letterBytes   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-		letterIdxBits = 6
-		letterIdxMask = 1<<letterIdxBits - 1
-		letterIdxMax  = 63 / letterIdxBits
-	)
-	var src = rand.NewSource(time.Now().UnixNano())
-	b := make([]byte, n)
-	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
-		if remain == 0 {
-			cache, remain = src.Int63(), letterIdxMax
-		}
-		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
-			b[i] = letterBytes[idx]
-			i--
-		}
-		cache >>= letterIdxBits
-		remain--
-	}
+func statifyFiles() {
+	// var (
+	// 	modified               string
+	// 	isDir                  int
+	// 	fileType               string
+	// 	fileMime               string
+	// 	avoidFurtherProcessing bool
+	// 	size                   int64 = 0
+	// )
 
-	return *(*string)(unsafe.Pointer(&b))
+	// // check if we're handling a directory or not
+	// // 	isDir = helpers.IsDirAsInt(de.IsDir())
+
+	// if isDir == 0 {
+
+	// 	if !avoidFurtherProcessing {
+	// 		fileType, fileMime, fileHash, avoidFurtherProcessing = extractTypeMime(filePath)
+
+	// 		stat, err := os.Stat(filePath)
+
+	// 		if err != nil {
+	// 			log.Println(err)
+	// 			avoidFurtherProcessing = true
+	// 		}
+
+	// 		if !avoidFurtherProcessing {
+	// 			modified = stat.ModTime().String()
+	// 			size = stat.Size()
+	// 		}
+	// 	}
+	// }
+	// file := File{
+	// 	Name:             de.Name(),
+	// 	Path:             filePath,
+	// 	Size:             size,
+	// 	Machine:          *hostname,
+	// 	IsDir:            0,
+	// 	IP:               myIP,
+	// 	OnExternalSource: tmp_on_external,
+	// 	ExternalName:     *externalName,
+	// 	FileType:         fileType,
+	// 	FileMIME:         fileMime,
+	// 	FileHash:         fileHash,
+	// 	Modified:         modified,
+	// }
+
+	// if c > 4999 {
+	// 	helpers.Log(nil, "found 5k files")
+	// 	c = 0
+	// }
+
+	// c++
+	// totalCount++
+
+	// if *dryRun {
+	// 	spew.Dump(file)
+	// } else {
+	// 	locFiles = append(locFiles, file)
+	// }
 }
