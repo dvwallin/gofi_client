@@ -2,6 +2,8 @@ package src
 
 import (
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -15,14 +17,17 @@ import (
 	"github.com/minio/highwayhash"
 )
 
-var fileSlice []*objects.File
-var errorCount int32
-var rootPath string
-var retrieverObject objects.Retriever
+var (
+	fileSlice      []objects.File
+	errorCount     int32
+	primaryCounter int
+	totalCount     int
+	retriever      *objects.Retriever
+)
 
-func GetFiles(retriever objects.Retriever) []*objects.File {
-	retrieverObject = retriever
-	err := filepath.Walk(retrieverObject.RootDir, callback)
+func GetFiles(retrieverObject *objects.Retriever) []objects.File {
+	retriever = retrieverObject
+	err := filepath.Walk(retriever.RootDir, callback)
 	Log(err, "")
 	return fileSlice
 }
@@ -34,26 +39,55 @@ func callback(path string, info os.FileInfo, err error) error {
 	} else {
 		if !info.IsDir() && info.Mode().IsRegular() {
 			external := 0
-			if retrieverObject.ExternalName != "" {
+			if retriever.ExternalName != "" {
 				external = 1
 			}
 			fullpath := strings.Replace(path, info.Name(), "", -1)
-			filetype, filemime, filehash := extractTypeMime(path)
+
+			var (
+				filetype string = "file_to_large"
+				filemime string = "file_to_large"
+				filehash string = "file_to_large"
+			)
+			if info.Size() < 6442450944 {
+				filetype, filemime, filehash = extractTypeMime(path)
+			} else {
+				Log(nil, fmt.Sprintf("%s is over 6gb", info.Name()))
+			}
 			file := objects.File{
 				Name:             info.Name(),
 				Path:             fullpath,
 				Modified:         info.ModTime().String(),
 				IsDir:            0,
-				Machine:          retrieverObject.Hostname,
+				Machine:          retriever.Hostname,
 				OnExternalSource: external,
-				ExternalName:     retrieverObject.ExternalName,
+				ExternalName:     retriever.ExternalName,
 				FileType:         filetype,
 				FileMIME:         filemime,
 				FileHash:         filehash,
 				Size:             info.Size(),
 			}
+			fileSlice = append(fileSlice, file)
 
-			fileSlice = append(fileSlice, &file)
+			if len(fileSlice) > *retriever.BatchLimit-1 {
+				jsonData, err := json.Marshal(fileSlice)
+
+				Log(err, "")
+				jsonFile, err := os.Create(fmt.Sprintf("%s%s%d.tmp.JSON", retriever.TmpDir, RandStringBytesMaskImprSrcUnsafe(5), primaryCounter))
+
+				Log(err, "")
+				primaryCounter++
+				defer jsonFile.Close()
+
+				_, err = jsonFile.Write(jsonData)
+				Log(err, "")
+				jsonFile.Close()
+				Log(nil, fmt.Sprintf("%d files written to %s", len(fileSlice), jsonFile.Name()))
+				totalCount = totalCount + len(fileSlice)
+				fileSlice = nil
+				fileSlice = []objects.File{}
+				Log(nil, fmt.Sprintf("fileSlice now contains %d items", len(fileSlice)))
+			}
 		}
 	}
 	return nil

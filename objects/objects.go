@@ -23,5 +23,8 @@ type (
 		Hostname     string
 		IP           string
 		ExternalName string
+		GGUID        string
+		TmpDir       string
+		BatchLimit   *int
 	}
 )

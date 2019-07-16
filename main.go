@@ -17,7 +17,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/dvwallin/gofi_client/objects"
 	"github.com/dvwallin/gofi_client/src"
 	_ "github.com/mattn/go-sqlite3"
@@ -42,15 +41,15 @@ const (
 )
 
 var (
-	myIP              string
-	generatedHostname string
-	myDir             string
-	err               error
+	myIP  string
+	myDir string
+	err   error
 
 	targetURL    *string = flag.String("target_url", fmt.Sprintf("127.0.0.1:%d", SERVER_PORT), "the URL where gofi_server is running")
 	externalName *string = flag.String("external_name", "", "set this to a name of the external source to label it as external")
 	rootDir      *string = flag.String("root_dir", ".", "which directory to start scanning in (then searches recursively)")
 	hostname     *string = flag.String("hostname", "", "manually declare the hostname of the index")
+	batchLimit   *int    = flag.Int("batchlimit", 5000, "number of files to write to each temporary json file. more memory can take higher limit")
 
 	// debug-related flags
 	cpuprof *string = flag.String("cpuprof", "", "the name of the cpuprof file")
@@ -58,9 +57,9 @@ var (
 
 	db          *sql.DB
 	stmt        *sql.Stmt
-	myGGUID     string = src.GetUUID()
-	storageFile string = fmt.Sprintf("./%s_%s", myGGUID, GOFI_DATABASE_NAME)
-	tmpDir      string = fmt.Sprintf("./%s/", myGGUID)
+	storageFile string
+	tmpDir      string
+	reciever    *objects.Retriever
 )
 
 func (mif MyFileInfo) Name() string       { return mif.name }
@@ -96,41 +95,24 @@ func init() {
 		src.Log(err, "")
 	}
 
+	// creating our reciever object for global information
+	reciever = &objects.Retriever{
+		RootDir:      *rootDir,
+		Hostname:     *hostname,
+		IP:           myIP,
+		ExternalName: *externalName,
+		GGUID:        src.GetUUID(),
+		BatchLimit:   batchLimit,
+	}
+
+	reciever.TmpDir = fmt.Sprintf("./%s/", reciever.GGUID)
+
 	myDir, err = os.Getwd()
 	src.Log(err, "")
 
-	err = src.CreateDirIfNotExist(myGGUID)
+	err = src.CreateDirIfNotExist(reciever.GGUID)
 	src.Log(err, "")
 
-	log.Println("connecting to", storageFile)
-
-	// connecting to database
-	db, err = sql.Open("sqlite3", storageFile)
-	src.Log(err, "")
-
-	// our schema for the temporary database
-	sqlStmt := `
-		CREATE TABLE IF NOT EXISTS files
-			(	id integer NOT NULL primary key,
-				name text NOT NULL,
-				path text NOT NULL,
-				size integer NOT NULL,
-				isdir integer NOT NULL,
-				machine text NOT NULL,
-				ip text NOT NULL,
-				onexternalsource integer NOT NULL,
-				externalname text NOT NULL,
-				filetype text NOT NULL,
-				filemime text NOT NULL,
-        filehash text NOT NULL,
-        modified text NOT NULL,
-			CONSTRAINT path_unique UNIQUE (path, machine, ip, onexternalsource, externalname, filehash)
-			);
-	`
-	_, err = db.Exec(sqlStmt)
-	src.Log(err, "")
-
-	db.Close()
 }
 
 func main() {
@@ -146,49 +128,38 @@ func main() {
 	defer f.Close()
 	log.SetOutput(f)
 
-	files := src.GetFiles(objects.Retriever{
-		RootDir:      *rootDir,
-		Hostname:     *hostname,
-		IP:           myIP,
-		ExternalName: *externalName,
-	})
+	files := src.GetFiles(reciever)
 
-	spew.Dump(files)
-
-	// OLD CODE
-
-	// running through all files, in the rootDir, recursively
-	// and fetches metadata of each file
-	// err = getFiles()
-	// src.Log(err, "")
+	storageFile = fmt.Sprintf("./%s_%s", reciever.GGUID, GOFI_DATABASE_NAME)
+	tmpDir = fmt.Sprintf("./%s/", reciever.GGUID)
 
 	addToTmpDB(files) // Adding files from JSON -files to local db
 
 	// opening the storageFile which is later used for temporarily storing
 	// all found files
-	// file, err := os.Open(storageFile)
-	// src.Log(err, "")
+	file, err := os.Open(storageFile)
+	src.Log(err, "")
 
 	// lets byte the hell out of the storageFile !!
-	// b, err := ioutil.ReadAll(file)
-	// src.Log(err, "")
+	b, err := ioutil.ReadAll(file)
+	src.Log(err, "")
 
 	// now we should have all the files and an open storageFile
 	// so let's connect to the server so we can send over the data
-	// connection, err := net.Dial("tcp", *targetURL)
-	// src.Log(err, "")
-	// defer connection.Close()
+	connection, err := net.Dial("tcp", *targetURL)
+	src.Log(err, "")
+	defer connection.Close()
 
 	// sending the files to the server for more permanent storage
-	// err = sendFileToServer(b, src.GetUUID(), connection)
-	// src.Log(err, "")
+	err = sendFileToServer(b, src.GetUUID(), connection)
+	src.Log(err, "")
 
 	// time to delete the temporary directory and the temporare storageFile
 	// since it should all have sent to the server by now
-	// err = src.Remove(storageFile)
-	// src.Log(err, "")
-	// err = src.Remove(tmpDir)
-	// src.Log(err, "")
+	err = src.Remove(storageFile)
+	src.Log(err, "")
+	err = src.Remove(tmpDir)
+	src.Log(err, "")
 
 }
 
@@ -213,14 +184,10 @@ func sendFileToServer(data []byte, id string, connection net.Conn) (err error) {
 
 	log.Println("sending name and size of temporary file ...")
 	_, err = connection.Write([]byte(fileSize))
-	if err != nil {
-		log.Println(err)
-	}
+	src.Log(err, "")
 
 	_, err = connection.Write([]byte(fillestringFilename))
-	if err != nil {
-		log.Println(err)
-	}
+	src.Log(err, "")
 
 	sendBuffer := make([]byte, BUFFERSIZE)
 	var sentBytes int64
@@ -233,9 +200,7 @@ func sendFileToServer(data []byte, id string, connection net.Conn) (err error) {
 			return err
 		}
 		_, err = connection.Write(sendBuffer)
-		if err != nil {
-			log.Println(err)
-		}
+		src.Log(err, "")
 		sentBytes += BUFFERSIZE
 	}
 	log.Println("storageFile file has been sent ...")
@@ -246,54 +211,66 @@ func sendFileToServer(data []byte, id string, connection net.Conn) (err error) {
 	return nil
 }
 
-func addToTmpDB(files *objects[]File) {
+func addToTmpDB(files []objects.File) {
 	var totalCount int = 0
 
+	log.Println("initiating saving files to database ...")
+
+	matches, err := filepath.Glob(fmt.Sprintf("%s*.tmp.JSON", tmpDir))
+	src.Log(err, "")
+
 	// Connect to the database
+	src.Log(nil, fmt.Sprintf("connecting to %s", storageFile))
 	db, err = sql.Open("sqlite3", storageFile)
-	if err != nil {
-		log.Println(err)
-	}
+	src.Log(err, "")
+
+	// our schema for the temporary database
+	sqlStmt := `
+		CREATE TABLE IF NOT EXISTS files
+			(	id integer NOT NULL primary key,
+				name text NOT NULL,
+				path text NOT NULL,
+				size integer NOT NULL,
+				isdir integer NOT NULL,
+				machine text NOT NULL,
+				ip text NOT NULL,
+				onexternalsource integer NOT NULL,
+				externalname text NOT NULL,
+				filetype text NOT NULL,
+				filemime text NOT NULL,
+                filehash text NOT NULL,
+                modified text NOT NULL,
+			CONSTRAINT path_unique UNIQUE (path, machine, ip, onexternalsource, externalname, filehash)
+			);
+	`
+	_, err = db.Exec(sqlStmt)
+	src.Log(err, "")
+
 	tx, err := db.Begin()
-	if err != nil {
-		log.Println(err)
-	}
+	src.Log(err, "")
 
 	stmt, err = tx.Prepare("INSERT OR IGNORE INTO files(name, path, size, isdir, machine, ip, onexternalsource, externalname, filetype, filemime, filehash, modified) values(?,?,?,?,?,?,?,?,?,?,?,?)")
-	if err != nil {
-		log.Println(err)
-	}
+	src.Log(err, "")
 
-	for _, fv := range files {
+	for _, fv := range matches {
 		jsonFile, err := os.Open(fv)
-
-		if err != nil {
-			log.Println(err)
-		}
+		src.Log(err, "")
 		fmt.Println("processing", fv, "=>", storageFile)
-		var partFiles objects.Files
+		var partFiles []*objects.File
 		byteValue, _ := ioutil.ReadAll(jsonFile)
 		err = json.Unmarshal(byteValue, &partFiles)
-		if err != nil {
-			log.Println(err)
-		}
-
+		src.Log(err, "")
 		for _, v := range partFiles {
 			_, err = stmt.Exec(v.Name, v.Path, v.Size, v.IsDir, v.Machine, v.IP, v.OnExternalSource, v.ExternalName, v.FileType, v.FileMIME, v.FileHash, v.Modified)
 			totalCount++
-
-			if err != nil {
-				log.Println(err)
-			}
+			src.Log(err, "")
 		}
 
 		jsonFile.Close()
 	}
 	log.Printf("\ncommitting %d files....\n", totalCount)
 	err = tx.Commit()
-	if err != nil {
-		log.Println(err)
-	}
+	src.Log(err, "")
 	db.Close()
 }
 
@@ -322,65 +299,4 @@ func initiateProf() {
 		f.Close()
 		return
 	}
-}
-
-func statifyFiles() {
-	// var (
-	// 	modified               string
-	// 	isDir                  int
-	// 	fileType               string
-	// 	fileMime               string
-	// 	avoidFurtherProcessing bool
-	// 	size                   int64 = 0
-	// )
-
-	// // check if we're handling a directory or not
-	// // 	isDir = helpers.IsDirAsInt(de.IsDir())
-
-	// if isDir == 0 {
-
-	// 	if !avoidFurtherProcessing {
-	// 		fileType, fileMime, fileHash, avoidFurtherProcessing = extractTypeMime(filePath)
-
-	// 		stat, err := os.Stat(filePath)
-
-	// 		if err != nil {
-	// 			log.Println(err)
-	// 			avoidFurtherProcessing = true
-	// 		}
-
-	// 		if !avoidFurtherProcessing {
-	// 			modified = stat.ModTime().String()
-	// 			size = stat.Size()
-	// 		}
-	// 	}
-	// }
-	// file := File{
-	// 	Name:             de.Name(),
-	// 	Path:             filePath,
-	// 	Size:             size,
-	// 	Machine:          *hostname,
-	// 	IsDir:            0,
-	// 	IP:               myIP,
-	// 	OnExternalSource: tmp_on_external,
-	// 	ExternalName:     *externalName,
-	// 	FileType:         fileType,
-	// 	FileMIME:         fileMime,
-	// 	FileHash:         fileHash,
-	// 	Modified:         modified,
-	// }
-
-	// if c > 4999 {
-	// 	helpers.Log(nil, "found 5k files")
-	// 	c = 0
-	// }
-
-	// c++
-	// totalCount++
-
-	// if *dryRun {
-	// 	spew.Dump(file)
-	// } else {
-	// 	locFiles = append(locFiles, file)
-	// }
 }
